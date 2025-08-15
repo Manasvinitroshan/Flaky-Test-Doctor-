@@ -1,0 +1,38 @@
+name: ci-tests
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          pip install -r requirements.txt
+          pip install jq
+
+      - name: Run tests
+        run: |
+          pytest -q | tee pytest.out
+        continue-on-error: true
+
+      - name: Build history
+        run: |
+          python cli/pytest_to_history.py pytest.out > history.json
+          cat history.json
+
+      - name: Report to MCP via HTTP facade (only on failure)
+        if: ${{ failure() }}
+        env:
+          MCP_FACADE_URL: ${{ secrets.MCP_FACADE_URL }}
+        run: |
+          HIST=$(cat history.json)
+          curl -sS -X POST "$MCP_FACADE_URL/is_flaky" \
+            -H "Content-Type: application/json" \
+            -d "{\"test_name\":\"suite\",\"history\":$HIST}" | jq
+          curl -sS -X POST "$MCP_FACADE_URL/suggest_fix" \
+            -H "Content-Type: application/json" \
+            -d "{\"test_name\":\"suite\",\"history\":$HIST}" | jq

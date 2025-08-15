@@ -1,8 +1,9 @@
 pydantic>=2.7
-# For agent_llm.py (optional LLM mode)
+
 openai>=1.40.0
-# For the HTTP facade + metrics + adapters
+
 fastapi
 uvicorn
 requests
 prometheus-fastapi-instrumentator
+pytest
