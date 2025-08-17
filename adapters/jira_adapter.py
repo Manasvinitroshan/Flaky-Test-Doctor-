@@ -1,4 +1,4 @@
-#jira_adapter.py
+# adapters/jira_adapter.py
 from __future__ import annotations
 import os
 from typing import Any, Dict, Optional
@@ -18,13 +18,29 @@ def _session(email: str, api_token: str) -> requests.Session:
     s.headers.update({"Accept":"application/json","Content-Type":"application/json"})
     return s
 
+# NEW: minimal helper to turn plain text into ADF
+def _adf_from_text(text: str) -> Dict[str, Any]:
+    text = text or ""
+    # Preserve newlines as hardBreaks inside a single paragraph
+    nodes = []
+    parts = text.split("\n")
+    for i, part in enumerate(parts):
+        if part:
+            nodes.append({"type": "text", "text": part})
+        if i < len(parts) - 1:
+            nodes.append({"type": "hardBreak"})
+    if not nodes:
+        nodes = [{"type": "text", "text": ""}]
+    return {"type": "doc", "version": 1, "content": [{"type": "paragraph", "content": nodes}]}
+
 class Jira:
     def __init__(self, base_url: Optional[str]=None,
                  email: Optional[str]=None,
                  api_token: Optional[str]=None):
         self.base = (base_url or os.getenv("JIRA_BASE_URL","")).rstrip("/")
         self.email = email or os.getenv("JIRA_EMAIL")
-        self.api_token = api_token or os.getenv("JIRA_API_TOKEN")
+        # Accept either JIRA_API_TOKEN (preferred) or JIRA_TOKEN
+        self.api_token = api_token or os.getenv("JIRA_API_TOKEN") or os.getenv("JIRA_TOKEN")
         if not (self.base and self.email and self.api_token):
             raise RuntimeError("JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN required")
         self.s = _session(self.email, self.api_token)
@@ -35,7 +51,8 @@ class Jira:
         payload = {"fields":{
             "project":{"key":project_key},
             "summary":summary,
-            "description":description,
+            # CHANGED: wrap description in ADF
+            "description": _adf_from_text(description),
             "issuetype":{"name":issue_type},
         }}
         r = self.s.post(url, json=payload, timeout=TIMEOUT); r.raise_for_status()
@@ -43,5 +60,6 @@ class Jira:
 
     def add_comment(self, issue_key: str, body: str) -> Dict[str, Any]:
         url = f"{self.base}/rest/api/3/issue/{issue_key}/comment"
-        r = self.s.post(url, json={"body":body}, timeout=TIMEOUT); r.raise_for_status()
+        # CHANGED: comments are also ADF in v3
+        r = self.s.post(url, json={"body": _adf_from_text(body)}, timeout=TIMEOUT); r.raise_for_status()
         return r.json()

@@ -93,8 +93,6 @@ ANSI_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")  # robust ANSI CSI matcher
 def _strip_ansi(s: str) -> str:
     return ANSI_RE.sub("", s)
 
-    
-
 def _run(cmd: List[str], cwd: Optional[str]=None, timeout: int=180) -> tuple[int, str]:
     p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     out, _ = p.communicate(timeout=timeout)
@@ -172,10 +170,9 @@ def _direct_harness_history(tmp_repo_root: str, rel_file: str, func: str, attemp
 def _analyze_code_for_flakiness(code: str) -> List[str]:
     """Very lightweight static hints pulled from the target file."""
     hints: List[str] = []
-    def add(s): 
+    def add(s):
         if s not in hints: hints.append(s)
     t = code
-
     if re.search(r"\brandom\.", t) and not re.search(r"\brandom\.seed\(", t):
         add("Seed the RNG (e.g., random.seed(0)) or inject a deterministic source.")
     if re.search(r"\btime\.sleep\(", t):
@@ -259,9 +256,15 @@ pre{background:#fafafa;border:1px solid #eee;padding:12px;border-radius:8px;over
     <div><label>Function (optional, for auto-test) <input id="funcName" placeholder="flaky_function"/></label></div>
   </div>
 
+  <div class="grid">
+    <div><label>Jira project key <input id="jiraProject" placeholder="ENG"/></label></div>
+    <div><label>Issue type <input id="jiraType" value="Task"/></label></div>
+  </div>
+
   <p>
     <button onclick="runPytest()">Run pytest → build history</button>
     <button onclick="suggestFixRepo()">Suggest fix (from repo history)</button>
+    <button onclick="createJiraFromRepo()">Create Jira (from repo)</button>
   </p>
 
   <p>
@@ -328,6 +331,18 @@ async function suggestFixRepo(){
   });
   document.getElementById('out2').textContent = JSON.stringify(res, null, 2);
   if(res && res.history) _appendHistoryField('hist2', res.history);
+}
+
+async function createJiraFromRepo(){
+  const repo = getVal('repo').trim(); if(!repo) return alert('Enter repo as owner/repo');
+  const test_name = getVal('name2') || 'suite';
+  const project_key = getVal('jiraProject').trim(); if(!project_key) return alert('Enter Jira project key');
+  const issue_type = getVal('jiraType').trim() || 'Task';
+  const res = await post('/create_jira_from_repo', {
+    repo, test_name, project_key, issue_type,
+    file_path: getVal('filePath') || undefined, func_name: getVal('funcName') || undefined
+  });
+  document.getElementById('out2').textContent = JSON.stringify(res, null, 2);
 }
 
 async function callActionsMetrics(){
@@ -400,6 +415,16 @@ class RunPytestBody(BaseModel):
 class SuggestFixRepoBody(BaseModel):
     repo: str
     test_name: str = "suite"
+    ref: Optional[str] = None
+    file_path: Optional[str] = None
+    func_name: Optional[str] = None
+
+# NEW: convenience body to create Jira directly from repo analysis
+class JiraFromRepoBody(BaseModel):
+    project_key: str
+    repo: str
+    test_name: str = "suite"
+    issue_type: str = "Task"
     ref: Optional[str] = None
     file_path: Optional[str] = None
     func_name: Optional[str] = None
@@ -512,3 +537,68 @@ def suggest_fix_repo(body: SuggestFixRepoBody):
         if s not in seen:
             merged.append(s); seen.add(s)
     return {"history": history, "suggestions": merged}
+
+
+# ---------------- NEW: create Jira directly from repo analysis ----------------
+@app.post("/create_jira_from_repo")
+def create_jira_from_repo(body: JiraFromRepoBody, request: Request):
+    """
+    Runs repo tests + suggestions, then opens a Jira with a compact markdown description.
+    Returns either {key, id, summary} OR {error, status, details}
+    """
+    opa_enforce(request)
+
+    # Reuse existing logic
+    sfix = suggest_fix_repo(SuggestFixRepoBody(
+        repo=body.repo, test_name=body.test_name, ref=body.ref,
+        file_path=body.file_path, func_name=body.func_name
+    ))
+    history = sfix.get("history", [])
+    suggestions = sfix.get("suggestions", [])
+
+    # Compose summary/description
+    summary = f"Flaky test detected: {body.test_name} in {body.repo}"
+    lines = []
+    lines.append(f"*Repo:* `{body.repo}`")
+    if body.file_path:
+        lines.append(f"*File:* `{body.file_path}`")
+    if body.func_name:
+        lines.append(f"*Function:* `{body.func_name}`")
+    if history:
+        lines.append(f"*History:* {json.dumps(history)}")
+    if suggestions:
+        lines.append("*Suggested fixes:*")
+        for s in suggestions:
+            lines.append(f"- {s}")
+    description = "\n".join(lines) if lines else "Automatically filed by Flaky Test Doctor."
+
+    # Create Jira with explicit error reporting
+    try:
+        j = Jira()  # may raise RuntimeError if env is missing
+    except RuntimeError as e:
+        # Surface which envs are required
+        raise HTTPException(status_code=500, detail=f"Jira init failed: {e}. "
+                            "Set JIRA_BASE_URL (e.g., https://<your-domain>.atlassian.net), "
+                            "JIRA_EMAIL, and JIRA_API_TOKEN.")
+
+    try:
+        out = j.create_issue(
+            project_key=body.project_key,
+            summary=summary,
+            description=description,
+            issue_type=body.issue_type or "Task",
+        )
+        return {"key": out.get("key"), "id": out.get("id"), "summary": summary}
+    except requests.HTTPError as e:
+        resp = e.response
+        status = getattr(resp, "status_code", 500)
+        # Try to extract Jira's JSON error payload for clarity
+        details = None
+        try:
+            details = resp.json()
+        except Exception:
+            details = getattr(resp, "text", str(e))
+        raise HTTPException(status_code=status, detail={"error": "Jira API error", "details": details})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": "Unexpected Jira error", "details": str(e)})
+
